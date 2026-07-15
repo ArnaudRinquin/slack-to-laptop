@@ -1,0 +1,10 @@
+{
+  "botToken": "xoxb-REPLACE",
+  "appToken": "xapp-REPLACE",
+  "port": 8365,
+  "taskDisplayMode": "timeline",
+  "staleStreamMinutes": 60,
+  "allowedUserIds": [],
+  "jobCommand": null,
+  "jobCwd": "/Users/arnaud/projects"
+}
