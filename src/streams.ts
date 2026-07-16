@@ -159,10 +159,18 @@ export class StreamOps {
     e.streamTs = res.ts;
     e.lastAppendAt = Date.now();
     e.streamStartedAt = Date.now();
+    // An actively-streaming message can't be deleted (cant_delete_message) —
+    // proactive rotation hits that; stop it first. Already-dead streams throw
+    // message_not_in_streaming_state here, which is fine.
+    try {
+      await this.client.chat.stopStream({ channel: e.channel, ts: deadTs });
+    } catch {
+      // already stopped/killed
+    }
     try {
       await this.client.chat.delete({ channel: e.channel, ts: deadTs });
     } catch (err) {
-      log(`restart: couldn't delete dead stream message ${deadTs}: ${err}`);
+      log(`restart: couldn't delete old stream message ${deadTs}: ${err}`);
     }
   }
 

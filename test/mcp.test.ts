@@ -128,6 +128,8 @@ test("keepalive rotates streams nearing Slack's kill window — replay + delete,
   expect(entry.streamTs).not.toBe(oldTs);
   const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
   expect((start.chunks as { id?: string }[])[0]?.id).toBe("boot"); // seeded with replay log
+  // still-live old stream must be stopped before deletion (cant_delete_message otherwise)
+  expect(calls.findLast((c) => c.method === "stopStream")!.args).toMatchObject({ ts: oldTs });
   expect(calls.findLast((c) => c.method === "delete")!.args).toMatchObject({ ts: oldTs });
 
   // young stream again → next tick does nothing
