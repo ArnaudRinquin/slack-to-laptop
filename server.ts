@@ -16,8 +16,8 @@ const config = loadConfig();
 const registry = new Registry();
 const ops = new StreamOps(new WebClient(config.botToken), registry, config);
 
-// Keepalive: Slack auto-closes streams left quiet for a few minutes (the message
-// then shows a warning) — re-append the last task card on idle streams.
+// Keepalive: Slack kills streams ~5–6 min in no matter what — this probe append
+// detects the death so StreamOps can restart invisibly (replay + delete).
 setInterval(() => void ops.keepalive(), 60_000).unref();
 
 // Stale sweep: a job that dies without calling finish() leaves the stream dangling

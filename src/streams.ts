@@ -13,7 +13,18 @@ const BOOT_CARD: TaskUpdateChunk = {
   status: "in_progress",
 };
 
-/** Slack auto-closes streams after a quiet stretch; appends then fail with this. */
+/** Cap on replayed prose so a restarted stream never exceeds Slack's message size limits. */
+const REPLAY_TEXT_CAP = 8_000;
+
+/**
+ * Slack hard-kills a stream ~5:00 after it opens, appends or not (measured; no
+ * keepalive can prevent it). Rotate proactively before that: with the 60s
+ * keepalive tick, rotation lands at age 3:30–4:30, comfortably before death —
+ * so viewers never see a dead "stopped" message.
+ */
+const ROTATE_MS = 3.5 * 60_000;
+
+/** Slack kills streams after ~5–6 min no matter what we append; appends then fail with this. */
 function isStreamDead(err: unknown): boolean {
   const e = err as { data?: { error?: string }; message?: string };
   return (
@@ -55,9 +66,10 @@ export class StreamOps {
       userId: args.userId,
       prompt: args.prompt,
       startedAt: now,
+      streamStartedAt: now,
       lastActivity: now,
       lastAppendAt: now,
-      lastChunk: BOOT_CARD,
+      chunks: [BOOT_CARD],
       bootPending: true,
     };
     this.registry.set(entry);
@@ -77,35 +89,81 @@ export class StreamOps {
   }
 
   /**
-   * Append with self-heal: Slack auto-closes streams left quiet too long — on
-   * message_not_in_streaming_state, open a fresh stream in the same thread,
-   * remap threadTs to it, and retry once.
+   * Append with self-heal: on message_not_in_streaming_state, restart the
+   * stream in place (replay + delete, see restart) and retry once.
    */
   private async append(e: StreamEntry, chunks: AnyChunk[]) {
     try {
       await this.client.chat.appendStream({ channel: e.channel, ts: e.streamTs, chunks });
     } catch (err) {
       if (!isStreamDead(err)) throw err;
-      log(`append: stream dead for ${e.threadTs}, restarting`);
-      await this.restart(e);
+      log(`append: stream dead for ${e.threadTs}, restarting in place`);
+      await this.restartOnce(e);
       await this.client.chat.appendStream({ channel: e.channel, ts: e.streamTs, chunks });
     }
     e.lastAppendAt = Date.now();
-    const lastTask = chunks.findLast((c) => c.type === "task_update");
-    if (lastTask) e.lastChunk = lastTask;
+    this.record(e, chunks);
   }
 
+  /** Concurrent MCP calls + the keepalive can race into restart — coalesce to one. */
+  private restarts = new Map<string, Promise<void>>();
+  private restartOnce(e: StreamEntry): Promise<void> {
+    let p = this.restarts.get(e.threadTs);
+    if (!p) {
+      p = this.restart(e).finally(() => this.restarts.delete(e.threadTs));
+      this.restarts.set(e.threadTs, p);
+    }
+    return p;
+  }
+
+  /** Fold appended chunks into the replay log: checklist state + bounded prose tail. */
+  private record(e: StreamEntry, chunks: AnyChunk[]) {
+    for (const c of chunks) {
+      if (c.type === "task_update") {
+        const i = e.chunks.findIndex((x) => x.type === "task_update" && x.id === c.id);
+        if (i >= 0) e.chunks[i] = c;
+        else e.chunks.push(c);
+      } else if (c.type === "markdown_text") {
+        const last = e.chunks[e.chunks.length - 1];
+        if (last?.type === "markdown_text") {
+          let text = last.text + c.text;
+          if (text.length > REPLAY_TEXT_CAP) text = "…" + text.slice(-REPLAY_TEXT_CAP);
+          e.chunks[e.chunks.length - 1] = { ...last, text };
+        } else {
+          e.chunks.push(c);
+        }
+      } else {
+        e.chunks.push(c);
+      }
+    }
+  }
+
+  /**
+   * Slack kills a stream ~5–6 min after it starts, even with appends every 60s
+   * (undocumented — measured in server.log). Naively reopening spams the thread
+   * with partial messages. Instead, restart invisibly: open a fresh stream
+   * seeded with the full replay log, then delete the dead message — the thread
+   * keeps exactly one live bot message.
+   */
   private async restart(e: StreamEntry) {
+    const deadTs = e.streamTs;
     const res = await this.client.chat.startStream({
       channel: e.channel,
       thread_ts: e.threadTs,
       recipient_team_id: e.teamId,
       recipient_user_id: e.userId,
       task_display_mode: this.config.taskDisplayMode,
+      chunks: e.chunks,
     });
     if (!res.ts) throw new Error(`restart startStream returned no ts: ${JSON.stringify(res)}`);
     e.streamTs = res.ts;
     e.lastAppendAt = Date.now();
+    e.streamStartedAt = Date.now();
+    try {
+      await this.client.chat.delete({ channel: e.channel, ts: deadTs });
+    } catch (err) {
+      log(`restart: couldn't delete dead stream message ${deadTs}: ${err}`);
+    }
   }
 
   /** First job-originated call completes the boot card in the same append. */
@@ -142,32 +200,58 @@ export class StreamOps {
     const boot = this.drainBoot(e);
     if (boot.length) await this.append(e, boot).catch(() => {});
     try {
-      await this.client.chat.stopStream({
-        channel: e.channel,
-        ts: e.streamTs,
-        ...(markdown ? { markdown_text: markdown } : {}),
-      });
+      await this.stop(e, markdown);
     } catch (err) {
       if (!isStreamDead(err)) throw err;
-      // Slack already closed it; deliver the final markdown as a plain reply so it isn't lost.
-      if (markdown) {
-        await this.client.chat.postMessage({ channel: e.channel, thread_ts: e.threadTs, text: markdown });
+      // Stream died since the last append — restart in place so the final
+      // markdown still lands in the single live message.
+      try {
+        await this.restartOnce(e);
+        await this.stop(e, markdown);
+      } catch (err2) {
+        log(`finish: restart+stop failed for ${threadTs} (${err2}), falling back to plain reply`);
+        if (markdown) {
+          await this.client.chat.postMessage({ channel: e.channel, thread_ts: e.threadTs, text: markdown });
+        }
       }
     }
     await this.clearStatus(e);
     this.registry.delete(threadTs);
   }
 
+  private stop(e: StreamEntry, markdown?: string) {
+    return this.client.chat.stopStream({
+      channel: e.channel,
+      ts: e.streamTs,
+      ...(markdown ? { markdown_text: markdown } : {}),
+    });
+  }
+
   /**
-   * Re-append the last task card (visually idempotent) on streams quiet for a
-   * while so Slack doesn't auto-close them mid-job. Deliberately does NOT touch
-   * lastActivity — only real job calls defer the stale sweep.
+   * Two duties per tick, per stream:
+   * 1. Proactive rotation — restart (replay + delete) BEFORE Slack's ~5:00
+   *    kill, so viewers never see a dead "stopped" message.
+   * 2. Idle probe — re-append the last task card (visually idempotent) as a
+   *    fallback detector: if the stream died anyway (laptop slept through the
+   *    rotation window), append() self-heals.
+   * Deliberately does NOT touch lastActivity — only real job calls defer the
+   * stale sweep.
    */
-  async keepalive(idleMs = 60_000) {
+  async keepalive(idleMs = 60_000, rotateMs = ROTATE_MS) {
     for (const e of this.registry.values()) {
+      if (Date.now() - e.streamStartedAt >= rotateMs) {
+        log(`keepalive: rotating stream for ${e.threadTs} (age ≥ ${Math.round(rotateMs / 1000)}s)`);
+        try {
+          await this.restartOnce(e);
+        } catch (err) {
+          log(`keepalive rotation failed for ${e.threadTs}: ${err}`);
+        }
+        continue;
+      }
       if (Date.now() - e.lastAppendAt < idleMs) continue;
+      const lastCard = e.chunks.findLast((c): c is TaskUpdateChunk => c.type === "task_update") ?? BOOT_CARD;
       try {
-        await this.append(e, [e.lastChunk]);
+        await this.append(e, [lastCard]);
       } catch (err) {
         log(`keepalive failed for ${e.threadTs}: ${err}`);
       }

@@ -10,12 +10,18 @@ export interface StreamEntry {
   userId: string;
   prompt: string;
   startedAt: number;
+  /** When the CURRENT Slack stream opened (reset on rotation) — drives proactive rotation. */
+  streamStartedAt: number;
   /** Last job-originated MCP call — drives the stale sweep. */
   lastActivity: number;
   /** Last append of any kind (incl. keepalive) — drives the keepalive. */
   lastAppendAt: number;
-  /** Re-appended unchanged as keepalive so Slack keeps the stream open. */
-  lastChunk: AnyChunk;
+  /**
+   * Replay log: current checklist state (task cards deduped by id, in first-seen
+   * order) + prose tail. Seeds the fresh stream when Slack kills the old one, so
+   * a restart is invisible.
+   */
+  chunks: AnyChunk[];
   /** Boot card still spinning — completed on the job's first MCP call. */
   bootPending: boolean;
 }

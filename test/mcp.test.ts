@@ -8,6 +8,7 @@ import type { Config } from "../src/config";
 const calls: { method: string; args: unknown }[] = [];
 let streamCounter = 0;
 let deadStreams = new Set<string>();
+let failStarts = false;
 
 const slackError = (code: string) =>
   Object.assign(new Error(`An API error occurred: ${code}`), { data: { ok: false, error: code } });
@@ -15,6 +16,7 @@ const slackError = (code: string) =>
 const fakeClient = {
   chat: {
     startStream: async (args: unknown) => {
+      if (failStarts) throw slackError("internal_error");
       calls.push({ method: "startStream", args });
       return { ok: true, ts: `999.${++streamCounter}` };
     },
@@ -29,6 +31,7 @@ const fakeClient = {
       return { ok: true };
     },
     postMessage: async (args: unknown) => (calls.push({ method: "postMessage", args }), { ok: true }),
+    delete: async (args: unknown) => (calls.push({ method: "delete", args }), { ok: true }),
   },
   assistant: {
     threads: {
@@ -116,6 +119,24 @@ test("full lifecycle: start (boot card) → thinking_step → append_text → fi
   expect(again.result.isError).toBe(true);
 });
 
+test("keepalive rotates streams nearing Slack's kill window — replay + delete, no new content", async () => {
+  const entry = await startEntry("rot.1");
+  const oldTs = entry.streamTs;
+  entry.streamStartedAt = Date.now() - 4 * 60_000; // past the rotation threshold
+
+  await ops.keepalive(60_000);
+  expect(entry.streamTs).not.toBe(oldTs);
+  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  expect((start.chunks as { id?: string }[])[0]?.id).toBe("boot"); // seeded with replay log
+  expect(calls.findLast((c) => c.method === "delete")!.args).toMatchObject({ ts: oldTs });
+
+  // young stream again → next tick does nothing
+  const before = calls.length;
+  await ops.keepalive(60_000);
+  expect(calls.length).toBe(before);
+  await ops.finish("rot.1");
+});
+
 test("keepalive re-appends last task card on idle streams only", async () => {
   const entry = await startEntry("kal.1");
   entry.lastAppendAt = Date.now() - 120_000; // idle
@@ -132,28 +153,56 @@ test("keepalive re-appends last task card on idle streams only", async () => {
   await ops.finish("kal.1");
 });
 
-test("self-heal: dead stream restarts transparently on append", async () => {
+test("self-heal: dead stream restarts in place — state replayed, dead message deleted", async () => {
   const entry = await startEntry("heal.1");
+  await ops.appendText("heal.1", "progress so far");
   const oldTs = entry.streamTs;
   deadStreams.add(oldTs);
 
   await ops.thinkingStep("heal.1", { id: "s1", title: "Step", status: "in_progress" });
   expect(entry.streamTs).not.toBe(oldTs); // remapped to a fresh stream
+
+  // fresh stream is seeded with the replay log: boot card + accumulated prose
+  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  const seeded = start.chunks as { type: string; id?: string; status?: string; text?: string }[];
+  expect(seeded[0]).toMatchObject({ id: "boot", status: "complete" });
+  expect(seeded.some((c) => c.type === "markdown_text" && c.text === "progress so far")).toBe(true);
+
+  // dead message removed → thread keeps exactly one bot message
+  expect(calls.findLast((c) => c.method === "delete")!.args).toMatchObject({ ts: oldTs });
+
   const append = calls.findLast((c) => c.method === "appendStream")!.args as Record<string, unknown>;
   expect(append.ts).toBe(entry.streamTs);
   await ops.finish("heal.1");
   deadStreams.clear();
 });
 
-test("finish on dead stream falls back to plain reply, still cleans up", async () => {
+test("finish on dead stream restarts in place, final markdown in stopStream", async () => {
   const entry = await startEntry("dead.1");
   entry.bootPending = false;
-  deadStreams.add(entry.streamTs);
+  const oldTs = entry.streamTs;
+  deadStreams.add(oldTs);
 
   await ops.finish("dead.1", "final words");
   expect(registry.has("dead.1")).toBe(false);
+  const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
+  expect(stop.ts).not.toBe(oldTs);
+  expect(stop).toMatchObject({ markdown_text: "final words" });
+  expect(calls.findLast((c) => c.method === "delete")!.args).toMatchObject({ ts: oldTs });
+  deadStreams.clear();
+});
+
+test("finish falls back to plain reply when even the restart fails", async () => {
+  const entry = await startEntry("dead.2");
+  entry.bootPending = false;
+  deadStreams.add(entry.streamTs);
+  failStarts = true;
+
+  await ops.finish("dead.2", "final words");
+  expect(registry.has("dead.2")).toBe(false);
   const post = calls.findLast((c) => c.method === "postMessage")!.args as Record<string, unknown>;
-  expect(post).toMatchObject({ thread_ts: "dead.1", text: "final words" });
+  expect(post).toMatchObject({ thread_ts: "dead.2", text: "final words" });
+  failStarts = false;
   deadStreams.clear();
 });
 
