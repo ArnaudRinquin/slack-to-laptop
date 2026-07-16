@@ -5,14 +5,16 @@ export const isSwiftBar = () =>
   process.argv.includes("--swiftbar");
 
 /**
- * Streamable SwiftBar plugin output: blocks on stdout separated by ~~~.
+ * Streamable SwiftBar plugin output. The `~~~` separator RESETS the menu item;
+ * SwiftBar renders what comes after it — so it must LEAD every block (a
+ * trailing separator leaves the item permanently empty).
  * process.stdout.write (not console.log) — piped stdout is block-buffered otherwise.
  */
 export function startSwiftBar(registry: Registry, port: number): () => void {
   const emit = () => {
     const entries = registry.values();
     const n = entries.length;
-    const lines: string[] = [];
+    const lines: string[] = ["~~~"];
     lines.push(n > 0 ? `🛰️ ${n}` : "🛰️");
     lines.push("---");
     lines.push(`Slack→Laptop — ${n} active stream${n === 1 ? "" : "s"}`);
@@ -23,7 +25,6 @@ export function startSwiftBar(registry: Registry, port: number): () => void {
     }
     lines.push("---");
     lines.push(`MCP http://127.0.0.1:${port}/mcp | color=gray`);
-    lines.push("~~~");
     process.stdout.write(lines.join("\n") + "\n");
   };
 

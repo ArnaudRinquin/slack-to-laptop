@@ -1,4 +1,4 @@
-import { App } from "@slack/bolt";
+import { App, LogLevel, type Logger } from "@slack/bolt";
 import { spawn } from "node:child_process";
 import type { Config } from "./config";
 import type { Registry } from "./registry";
@@ -6,10 +6,28 @@ import type { StreamOps } from "./streams";
 import { log } from "./log";
 
 export function createSlackApp(config: Config, registry: Registry, ops: StreamOps): App {
+  // Route Bolt/socket-mode logs through log() so they land in the log file
+  // (raw console output would be lost to SwiftBar's stderr pipe).
+  let boltLevel = LogLevel.INFO;
+  const boltLogger: Logger = {
+    // custom loggers do their own filtering — Bolt calls debug() regardless of logLevel
+    debug: (...msgs) => {
+      if (boltLevel === LogLevel.DEBUG) log(`bolt DEBUG ${msgs.join(" ")}`);
+    },
+    info: (...msgs) => log(`bolt ${msgs.join(" ")}`),
+    warn: (...msgs) => log(`bolt WARN ${msgs.join(" ")}`),
+    error: (...msgs) => log(`bolt ERROR ${msgs.join(" ")}`),
+    setLevel: (level) => (boltLevel = level),
+    getLevel: () => boltLevel,
+    setName: () => {},
+  };
+
   const app = new App({
     token: config.botToken,
     appToken: config.appToken,
     socketMode: true,
+    logger: boltLogger,
+    logLevel: LogLevel.INFO,
   });
 
   // Slack redelivers unacked events after 3s — dedupe so a redelivery can't spawn a second job.
