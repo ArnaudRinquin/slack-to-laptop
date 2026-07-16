@@ -103,6 +103,7 @@ export class StreamOps {
     }
     e.lastAppendAt = Date.now();
     this.record(e, chunks);
+    this.registry.persistSoon();
   }
 
   /** Concurrent MCP calls + the keepalive can race into restart — coalesce to one. */
@@ -159,6 +160,7 @@ export class StreamOps {
     e.streamTs = res.ts;
     e.lastAppendAt = Date.now();
     e.streamStartedAt = Date.now();
+    this.registry.persistSoon();
     // An actively-streaming message can't be deleted (cant_delete_message) —
     // proactive rotation hits that; stop it first. Already-dead streams throw
     // message_not_in_streaming_state here, which is fine.

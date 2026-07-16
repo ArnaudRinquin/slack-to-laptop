@@ -5,7 +5,10 @@ remote HTTP MCP server that Claude Code worktree jobs call to drive the native
 Slack stream, and SwiftBar menubar status.
 
 `threadTs` is the correlation key: the worktree job only ever knows `threadTs`;
-this process maps it to the real Slack stream id in memory.
+this process maps it to the real Slack stream id. The map is snapshotted to
+`~/.cache/slack-to-laptop/registry.json`, so restarting the bridge (deploys,
+crashes) doesn't interrupt running jobs: on boot, restored streams are
+force-rotated by the first keepalive tick — rotation doubles as recovery.
 
 ## Slack app (one-time)
 

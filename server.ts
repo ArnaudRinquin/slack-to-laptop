@@ -2,7 +2,10 @@
 //  1. Slack Socket Mode listener — @mention opens a native stream instantly
 //  2. Remote HTTP MCP server at /mcp — worktree Claude drives the stream via threadTs
 //  3. SwiftBar streamable plugin — menubar status (when launched by SwiftBar / --swiftbar)
-// The Slack stream id lives only in this process's memory; that's why it's one process.
+// The threadTs → stream map is in-memory, snapshotted to ~/.cache/slack-to-laptop/
+// registry.json so bridge restarts don't interrupt running jobs.
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { WebClient } from "@slack/web-api";
 import { loadConfig } from "./src/config";
 import { Registry } from "./src/registry";
@@ -13,8 +16,13 @@ import { isSwiftBar, startSwiftBar } from "./src/swiftbar";
 import { log } from "./src/log";
 
 const config = loadConfig();
-const registry = new Registry();
+const registry = new Registry(join(homedir(), ".cache", "slack-to-laptop", "registry.json"));
 const ops = new StreamOps(new WebClient(config.botToken), registry, config);
+
+// Streams survive bridge restarts: restore the map, let the first keepalive
+// tick force-rotate (revalidate) every restored stream.
+const restored = registry.load(config.staleStreamMinutes * 60_000);
+if (restored) log(`restored ${restored} stream(s) from previous run`);
 
 // Keepalive: Slack kills streams ~5–6 min in no matter what — this probe append
 // detects the death so StreamOps can restart invisibly (replay + delete).
@@ -37,8 +45,10 @@ await slackApp.start();
 log("Slack socket-mode connection up");
 
 async function shutdown() {
-  log("shutting down: stopping live streams…");
-  await Promise.allSettled(registry.values().map((e) => ops.kill(e, "🔌 Server shut down.")));
+  // Streams are deliberately left open: the registry file lets the next
+  // process pick them up, so a redeploy doesn't interrupt running jobs.
+  log(`shutting down: persisting ${registry.values().length} live stream(s)…`);
+  registry.persistNow();
   httpServer.close();
   await slackApp.stop().catch(() => {});
   process.exit(0);

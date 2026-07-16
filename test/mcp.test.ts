@@ -208,6 +208,26 @@ test("finish falls back to plain reply when even the restart fails", async () =>
   deadStreams.clear();
 });
 
+test("registry persists and restores across processes; stale entries dropped", async () => {
+  const path = `${import.meta.dir}/.tmp-registry-${Date.now()}.json`;
+  const r1 = new Registry(path);
+  const live = { ...(await startEntry("per.1")), lastActivity: Date.now() };
+  const stale = { ...live, threadTs: "per.2", lastActivity: Date.now() - 2 * 60 * 60_000 };
+  r1.set(live);
+  r1.set(stale);
+  r1.persistNow();
+  registry.delete("per.1"); // startEntry used the shared registry; clean up
+
+  const r2 = new Registry(path);
+  expect(r2.load(60 * 60_000)).toBe(1); // stale one dropped
+  const restored = r2.get("per.1")!;
+  expect(restored.streamTs).toBe(live.streamTs);
+  expect(restored.chunks[0]).toMatchObject({ id: "boot" }); // replay log survives
+  expect(restored.streamStartedAt).toBe(0); // forces rotation on first keepalive
+  const { unlinkSync } = await import("node:fs");
+  unlinkSync(path);
+});
+
 test("healthz lists active streams", async () => {
   await startEntry("333.444", "C2");
   const res = (await (await fetch(`http://127.0.0.1:${PORT}/healthz`)).json()) as { activeStreams: { threadTs: string }[] };
