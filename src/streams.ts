@@ -77,21 +77,37 @@ export class StreamOps {
       streamStartedAt: now,
       lastActivity: now,
       lastAppendAt: now,
+      liveCards: [BOOT_CARD],
       bootPending: true,
     };
     this.registry.set(entry);
     return entry;
   }
 
+  /** Keep entry.liveCards = the in_progress cards of the CURRENT segment. */
+  private trackCards(e: StreamEntry, chunks: AnyChunk[]) {
+    for (const c of chunks) {
+      if (c.type !== "task_update") continue;
+      e.liveCards = e.liveCards.filter((x) => x.id !== c.id);
+      if (c.status === "in_progress") e.liveCards.push(c);
+    }
+  }
+
   /**
-   * Close the live segment cleanly: append the sign-off, then a PLAIN stop.
+   * Close the live segment cleanly: complete any in_progress cards (Slack
+   * renders them frozen with a ⚠️ otherwise — the live step continues in the
+   * next segment anyway), append the sign-off, then a PLAIN stop.
    * (stopStream with markdown_text only works on chunk-less streams —
    * streaming_mode_mismatch otherwise; measured.)
    */
   private async closeSegment(e: StreamEntry, closer?: string) {
-    if (closer) {
+    const closingChunks: AnyChunk[] = [
+      ...e.liveCards.map((c) => ({ ...c, status: "complete" as const })),
+      ...(closer ? [{ type: "markdown_text", text: closer } as AnyChunk] : []),
+    ];
+    if (closingChunks.length) {
       await this.client.chat
-        .appendStream({ channel: e.channel, ts: e.streamTs, chunks: [{ type: "markdown_text", text: closer }] })
+        .appendStream({ channel: e.channel, ts: e.streamTs, chunks: closingChunks })
         .catch(() => {}); // already dead — nothing to sign off
     }
     try {
@@ -100,6 +116,7 @@ export class StreamOps {
       if (!isStreamDead(err)) log(`closeSegment: stop failed for ${e.threadTs}: ${err}`);
     }
     e.mode = "idle";
+    e.liveCards = [];
     this.registry.persistSoon();
   }
 
@@ -139,6 +156,8 @@ export class StreamOps {
       e.mode = "stream";
       e.streamStartedAt = Date.now();
       e.lastAppendAt = Date.now();
+      e.liveCards = [];
+      this.trackCards(e, chunks);
       this.registry.persistSoon();
     })().finally(() => this.openings.delete(e.threadTs));
     this.openings.set(e.threadTs, p);
@@ -159,6 +178,7 @@ export class StreamOps {
     try {
       await this.client.chat.appendStream({ channel: e.channel, ts: e.streamTs, chunks });
       e.lastAppendAt = Date.now();
+      this.trackCards(e, chunks);
       this.registry.persistSoon();
     } catch (err) {
       if (!isStreamDead(err)) throw err;
@@ -168,6 +188,7 @@ export class StreamOps {
       if (!delivered) {
         await this.client.chat.appendStream({ channel: e.channel, ts: e.streamTs, chunks });
         e.lastAppendAt = Date.now();
+        this.trackCards(e, chunks);
         this.registry.persistSoon();
       }
     }
@@ -212,13 +233,8 @@ export class StreamOps {
         ...(markdown ? [{ type: "markdown_text", text: markdown } as AnyChunk] : []),
       ];
       if (chunks.length) await this.append(e, chunks);
-      if (e.mode === "stream") {
-        try {
-          await this.client.chat.stopStream({ channel: e.channel, ts: e.streamTs });
-        } catch (err) {
-          if (!isStreamDead(err)) throw err;
-        }
-      }
+      // closeSegment completes any lingering in_progress cards (⚠️ otherwise)
+      if (e.mode === "stream") await this.closeSegment(e);
     } catch (err) {
       log(`finish: delivery failed for ${threadTs} (${err}), falling back to plain reply`);
       if (markdown) {

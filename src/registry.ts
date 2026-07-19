@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import type { TaskUpdateChunk } from "@slack/types";
 import { log } from "./log";
 
 export interface StreamEntry {
@@ -24,6 +25,12 @@ export interface StreamEntry {
   lastActivity: number;
   /** Last successful append to the current segment. */
   lastAppendAt: number;
+  /**
+   * Task cards currently in_progress in the LIVE segment. Slack renders frozen
+   * in_progress cards with a ⚠️ once the stream stops — so closes mark these
+   * complete first (the step visibly continues in the next segment).
+   */
+  liveCards: TaskUpdateChunk[];
   /** Boot card still spinning — completed on the job's first MCP call. */
   bootPending: boolean;
 }
@@ -57,6 +64,7 @@ export class Registry {
     const cutoff = Date.now() - maxAgeMs;
     for (const e of entries) {
       if (!e?.threadTs || e.lastActivity < cutoff) continue;
+      e.liveCards ??= [];
       this.map.set(e.threadTs, e);
     }
     if (this.map.size) this.onChange();

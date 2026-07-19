@@ -117,8 +117,11 @@ test("full lifecycle: start (boot card) → thinking_step → append_text → fi
   expect(registry.has("111.222")).toBe(false);
   // final markdown travels via appendStream; the stop is PLAIN (md-stop on a
   // chunked stream → streaming_mode_mismatch, enforced by the fake)
-  const lastAppend = calls.findLast((c) => c.method === "appendStream")!.args as Record<string, unknown>;
-  expect((lastAppend.chunks as { text?: string }[]).some((c) => c.text === "done")).toBe(true);
+  const appends = calls.filter((c) => c.method === "appendStream").map((c) => c.args as Record<string, unknown>);
+  expect(appends.some((a) => (a.chunks as { text?: string }[]).some((c) => c.text === "done"))).toBe(true);
+  // the close completed the still-in_progress card so it doesn't freeze as ⚠️
+  const closing = appends[appends.length - 1]!.chunks as { id?: string; status?: string }[];
+  expect(closing.some((c) => c.id === "run-tests" && c.status === "complete")).toBe(true);
   const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
   expect(stop).toMatchObject({ channel: "C1", ts: entry.streamTs });
   expect(stop.markdown_text).toBeUndefined();
@@ -137,9 +140,11 @@ test("keepalive closes aging segments cleanly; next content lazily opens a fresh
 
   await ops.keepalive(210_000);
   expect(entry.mode).toBe("idle");
-  // sign-off appended, then a PLAIN stop
+  // in_progress cards completed + sign-off appended, then a PLAIN stop
   const closer = calls.findLast((c) => c.method === "appendStream")!.args as Record<string, unknown>;
-  expect((closer.chunks as { text?: string }[])[0]?.text).toContain("still working");
+  const closerChunks = closer.chunks as { id?: string; status?: string; text?: string }[];
+  expect(closerChunks.some((c) => c.id === "boot" && c.status === "complete")).toBe(true); // no frozen ⚠️
+  expect(closerChunks.some((c) => c.text?.includes("still working"))).toBe(true);
   const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
   expect(stop.ts).toBe(oldTs);
   expect(stop.markdown_text).toBeUndefined();
