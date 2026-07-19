@@ -8,36 +8,36 @@ import type { Config } from "../src/config";
 const calls: { method: string; args: unknown }[] = [];
 let streamCounter = 0;
 let deadStreams = new Set<string>();
+const streamsWithChunks = new Set<string>(); // mirrors Slack: md-stop only allowed on chunk-less streams
 let failStarts = false;
-let failUpdates = false;
 
 const slackError = (code: string) =>
   Object.assign(new Error(`An API error occurred: ${code}`), { data: { ok: false, error: code } });
 
 const fakeClient = {
   chat: {
-    startStream: async (args: unknown) => {
+    startStream: async (args: { chunks?: unknown[] }) => {
       if (failStarts) throw slackError("internal_error");
       calls.push({ method: "startStream", args });
-      return { ok: true, ts: `999.${++streamCounter}` };
+      const ts = `999.${++streamCounter}`;
+      if (args.chunks?.length) streamsWithChunks.add(ts);
+      return { ok: true, ts };
     },
     appendStream: async (args: { ts: string }) => {
       if (deadStreams.has(args.ts)) throw slackError("message_not_in_streaming_state");
       calls.push({ method: "appendStream", args });
+      streamsWithChunks.add(args.ts);
       return { ok: true };
     },
-    stopStream: async (args: { ts: string }) => {
+    stopStream: async (args: { ts: string; markdown_text?: string }) => {
       if (deadStreams.has(args.ts)) throw slackError("message_not_in_streaming_state");
+      // real Slack behavior (measured): markdown_text finalizer + any prior chunk → error
+      if (args.markdown_text && streamsWithChunks.has(args.ts)) throw slackError("streaming_mode_mismatch");
       calls.push({ method: "stopStream", args });
       return { ok: true };
     },
     postMessage: async (args: unknown) => (calls.push({ method: "postMessage", args }), { ok: true }),
     delete: async (args: unknown) => (calls.push({ method: "delete", args }), { ok: true }),
-    update: async (args: unknown) => {
-      if (failUpdates) throw slackError("message_not_found");
-      calls.push({ method: "update", args });
-      return { ok: true };
-    },
   },
   assistant: {
     threads: {
@@ -115,8 +115,13 @@ test("full lifecycle: start (boot card) → thinking_step → append_text → fi
   const fin = await callTool("finish", { threadTs: "111.222", markdown: "done" });
   expect(fin.result.content[0].text).toBe("stream finished");
   expect(registry.has("111.222")).toBe(false);
+  // final markdown travels via appendStream; the stop is PLAIN (md-stop on a
+  // chunked stream → streaming_mode_mismatch, enforced by the fake)
+  const lastAppend = calls.findLast((c) => c.method === "appendStream")!.args as Record<string, unknown>;
+  expect((lastAppend.chunks as { text?: string }[]).some((c) => c.text === "done")).toBe(true);
   const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
-  expect(stop).toMatchObject({ channel: "C1", ts: entry.streamTs, markdown_text: "done" });
+  expect(stop).toMatchObject({ channel: "C1", ts: entry.streamTs });
+  expect(stop.markdown_text).toBeUndefined();
   // status cleared on finish
   expect(calls.findLast((c) => c.method === "setStatus")!.args).toMatchObject({ status: "" });
 
@@ -125,53 +130,69 @@ test("full lifecycle: start (boot card) → thinking_step → append_text → fi
   expect(again.result.isError).toBe(true);
 });
 
-test("keepalive converts aging streams to update-mode — same message, no new stream, no delete", async () => {
-  const entry = await startEntry("cnv.1");
+test("keepalive closes aging segments cleanly; next content lazily opens a fresh one", async () => {
+  const entry = await startEntry("seg.1");
   const oldTs = entry.streamTs;
-  const startsBefore = calls.filter((c) => c.method === "startStream").length;
-  const deletesBefore = calls.filter((c) => c.method === "delete").length;
-  entry.streamStartedAt = Date.now() - 4 * 60_000; // past the conversion threshold
+  entry.streamStartedAt = Date.now() - 4 * 60_000; // past the segment window
 
   await ops.keepalive(210_000);
-  expect(entry.mode).toBe("update");
-  expect(entry.streamTs).toBe(oldTs); // SAME message forever
-  expect(calls.filter((c) => c.method === "startStream").length).toBe(startsBefore); // no new stream
-  expect(calls.filter((c) => c.method === "delete").length).toBe(deletesBefore); // no delete
-  expect(calls.findLast((c) => c.method === "stopStream")!.args).toMatchObject({ ts: oldTs });
-  expect(calls.findLast((c) => c.method === "update")!.args).toMatchObject({ ts: oldTs });
+  expect(entry.mode).toBe("idle");
+  // sign-off appended, then a PLAIN stop
+  const closer = calls.findLast((c) => c.method === "appendStream")!.args as Record<string, unknown>;
+  expect((closer.chunks as { text?: string }[])[0]?.text).toContain("still working");
+  const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
+  expect(stop.ts).toBe(oldTs);
+  expect(stop.markdown_text).toBeUndefined();
+  expect(calls.some((c) => c.method === "delete")).toBe(false); // chapters are kept
 
-  // subsequent appends edit the same message in place, re-rendering full state
-  await ops.thinkingStep("cnv.1", { id: "s1", title: "Later step", status: "in_progress" });
-  const upd = calls.findLast((c) => c.method === "update")!.args as { ts: string; text: string };
-  expect(upd.ts).toBe(oldTs);
-  expect(upd.text).toContain("⏳ Later step");
-  expect(upd.text).toContain("✅ Booting worktree job");
-
-  // next tick: already converted → nothing to do
+  // idle + no content → nothing happens (quiet stretches create no messages)
   const before = calls.length;
   await ops.keepalive(210_000);
   expect(calls.length).toBe(before);
-  await ops.finish("cnv.1");
+
+  // next content opens a fresh segment seeded with exactly that content
+  await ops.thinkingStep("seg.1", { id: "s1", title: "Next step", status: "in_progress" });
+  expect(entry.mode).toBe("stream");
+  expect(entry.streamTs).not.toBe(oldTs);
+  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  const seeded = start.chunks as { id?: string }[];
+  expect(seeded.some((c) => c.id === "s1")).toBe(true);
+  await ops.finish("seg.1");
 });
 
-test("self-heal: stream dead before conversion — chunks folded in, converted, same message", async () => {
+test("self-heal: segment died before the clean close — next append opens a fresh segment", async () => {
   const entry = await startEntry("heal.1");
   await ops.appendText("heal.1", "progress so far");
   const oldTs = entry.streamTs;
   deadStreams.add(oldTs);
 
   await ops.thinkingStep("heal.1", { id: "s1", title: "Step", status: "in_progress" });
-  expect(entry.mode).toBe("update");
-  expect(entry.streamTs).toBe(oldTs); // no new message, ever
-  const upd = calls.findLast((c) => c.method === "update")!.args as { ts: string; text: string };
-  expect(upd.ts).toBe(oldTs);
-  expect(upd.text).toContain("progress so far");
-  expect(upd.text).toContain("⏳ Step");
+  expect(entry.mode).toBe("stream");
+  expect(entry.streamTs).not.toBe(oldTs);
+  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  expect((start.chunks as { id?: string }[]).some((c) => c.id === "s1")).toBe(true);
   await ops.finish("heal.1");
   deadStreams.clear();
 });
 
-test("finish on dead stream delivers final markdown via chat.update on the same message", async () => {
+test("finish on idle entry delivers the final as its own native, immediately-closed segment", async () => {
+  const entry = await startEntry("idle.1");
+  entry.bootPending = false;
+  entry.streamStartedAt = Date.now() - 4 * 60_000;
+  await ops.keepalive(210_000);
+  expect(entry.mode).toBe("idle");
+
+  await ops.finish("idle.1", "final words");
+  expect(registry.has("idle.1")).toBe(false);
+  // the final opened its own segment seeded with the markdown, then plain-stopped
+  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  expect((start.chunks as { text?: string }[]).some((c) => c.text === "final words")).toBe(true);
+  const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
+  expect(stop.ts).toBe(entry.streamTs); // the fresh final segment
+  expect(stop.markdown_text).toBeUndefined();
+});
+
+test("finish on dead segment delivers the final via a fresh segment", async () => {
   const entry = await startEntry("dead.1");
   entry.bootPending = false;
   const oldTs = entry.streamTs;
@@ -179,23 +200,25 @@ test("finish on dead stream delivers final markdown via chat.update on the same 
 
   await ops.finish("dead.1", "final words");
   expect(registry.has("dead.1")).toBe(false);
-  const upd = calls.findLast((c) => c.method === "update")!.args as { ts: string; text: string };
-  expect(upd.ts).toBe(oldTs);
-  expect(upd.text).toContain("final words");
+  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  expect((start.chunks as { text?: string }[]).some((c) => c.text === "final words")).toBe(true);
+  const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
+  expect(stop.ts).not.toBe(oldTs);
+  expect(stop.markdown_text).toBeUndefined();
   deadStreams.clear();
 });
 
-test("finish falls back to plain reply when even chat.update fails", async () => {
+test("finish falls back to plain reply when even the fresh segment fails", async () => {
   const entry = await startEntry("dead.2");
   entry.bootPending = false;
   deadStreams.add(entry.streamTs);
-  failUpdates = true;
+  failStarts = true;
 
   await ops.finish("dead.2", "final words");
   expect(registry.has("dead.2")).toBe(false);
   const post = calls.findLast((c) => c.method === "postMessage")!.args as Record<string, unknown>;
   expect(post).toMatchObject({ thread_ts: "dead.2", text: "final words" });
-  failUpdates = false;
+  failStarts = false;
   deadStreams.clear();
 });
 
@@ -213,8 +236,7 @@ test("registry persists and restores across processes; stale entries dropped", a
   expect(r2.load(60 * 60_000)).toBe(1); // stale one dropped
   const restored = r2.get("per.1")!;
   expect(restored.streamTs).toBe(live.streamTs);
-  expect(restored.chunks[0]).toMatchObject({ id: "boot" }); // replay log survives
-  expect(restored.mode).toBe("stream"); // adoptRestored() converts these on boot
+  expect(restored.mode).toBe("stream"); // adoptRestored() closes these on boot
   const { unlinkSync } = await import("node:fs");
   unlinkSync(path);
 });

@@ -75,12 +75,16 @@ A job that dies without `finish` gets swept: streams idle > `staleStreamMinutes`
 
 Slack hard-kills a stream ~5:00 after it opens, no matter what is appended
 (undocumented; measured — a true keepalive is impossible, even with changing
-content). The bridge therefore streams natively only while the message is
-young, then *converts*: stops the stream cleanly at age ~3.5–4.5 min and edits
-the same message in place via `chat.update` from then on (works on stopped
-streamed messages — also measured). The checklist is rendered as markdown.
-One message per job, created once — no deletes, no re-creates, no thread
-activity, no notification noise.
+content). Jobs therefore stream in *segments*: each streamed message is closed
+cleanly at age ~3.5–4.5 min with a "_⏳ still working…_" sign-off (no kill
+warning), and the next segment is opened lazily — only when the job next has
+content. Every message is a finished chapter; quiet stretches create nothing;
+nothing is ever deleted or edited away. The final summary gets its own
+immediately-closed native segment when needed.
+
+API gotcha (measured): `chat.stopStream` with `markdown_text` only works on a
+stream with NO chunks appended — `streaming_mode_mismatch` otherwise. Closers
+and finals must go through `chat.appendStream`, then a plain stop.
 
 ## Job-side skill
 

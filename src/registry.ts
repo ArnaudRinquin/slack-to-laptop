@@ -1,17 +1,16 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { AnyChunk } from "@slack/types";
 import { log } from "./log";
 
 export interface StreamEntry {
   threadTs: string;
   channel: string;
   /**
-   * "stream": native Slack stream, first ~3.5 min only (Slack hard-kills
-   * streams at ~5:00). "update": stream stopped cleanly; the same message is
-   * edited in place via chat.update from then on — no new thread messages.
+   * "stream": a native Slack streamed message (segment) is live. "idle": the
+   * segment was closed cleanly before Slack's ~5:00 kill; the next job call
+   * lazily opens a fresh segment.
    */
-  mode: "stream" | "update";
+  mode: "stream" | "idle";
   /** ts returned by chat.startStream — the real Slack stream id. Never leaves this process. */
   streamTs: string;
   /** Needed to restart the stream if Slack auto-closes it during a quiet stretch. */
@@ -23,14 +22,8 @@ export interface StreamEntry {
   streamStartedAt: number;
   /** Last job-originated MCP call — drives the stale sweep. */
   lastActivity: number;
-  /** Last append of any kind (incl. keepalive) — drives the keepalive. */
+  /** Last successful append to the current segment. */
   lastAppendAt: number;
-  /**
-   * Replay log: current checklist state (task cards deduped by id, in first-seen
-   * order) + prose tail. Seeds the fresh stream when Slack kills the old one, so
-   * a restart is invisible.
-   */
-  chunks: AnyChunk[];
   /** Boot card still spinning — completed on the job's first MCP call. */
   bootPending: boolean;
 }
@@ -50,9 +43,8 @@ export class Registry {
 
   /**
    * Reload entries persisted by a previous process, dropping anything the
-   * sweep would kill anyway. Restored entries are forced to update-mode: their
-   * stream (if any) is of unknown liveness and likely past Slack's ~5:00 kill;
-   * StreamOps.adoptRestored() stops it best-effort and edits from there.
+   * sweep would kill anyway. StreamOps.adoptRestored() then closes any live
+   * segment cleanly; the next job call opens a fresh one.
    */
   load(maxAgeMs: number): number {
     if (!this.persistPath) return 0;
