@@ -13,10 +13,13 @@ mkdirSync(join(homedir(), ".cache", "slack-to-laptop"), { recursive: true });
  */
 export function log(msg: string) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
-  try {
-    appendFileSync(LOG_PATH, line);
-  } catch {
-    // file logging is best-effort
+  // bun test sets NODE_ENV=test — keep test noise out of the real log file
+  if (process.env.NODE_ENV !== "test") {
+    try {
+      appendFileSync(LOG_PATH, line);
+    } catch {
+      // file logging is best-effort
+    }
   }
   process.stderr.write(line);
 }
