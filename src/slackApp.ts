@@ -3,9 +3,11 @@ import { spawn } from "node:child_process";
 import type { Config } from "./config";
 import type { Registry } from "./registry";
 import type { StreamOps } from "./streams";
+import type { JobsIndex } from "./jobs";
+import { findPane, injectText, listPanes } from "./inject";
 import { log } from "./log";
 
-export function createSlackApp(config: Config, registry: Registry, ops: StreamOps): App {
+export function createSlackApp(config: Config, registry: Registry, ops: StreamOps, jobs: JobsIndex): App {
   // Route Bolt/socket-mode logs through log() so they land in the log file
   // (raw console output would be lost to SwiftBar's stderr pipe).
   let boltLevel = LogLevel.INFO;
@@ -64,20 +66,61 @@ export function createSlackApp(config: Config, registry: Registry, ops: StreamOp
       return;
     }
 
-    if (registry.has(threadTs)) {
-      log(`collision: live stream already exists for thread ${threadTs}, skipping`);
-      await client.chat.postMessage({
-        channel: event.channel,
-        thread_ts: threadTs,
-        text: "⚠️ A job is already streaming to this thread — wait for it to finish (or for the stale sweep) before mentioning me again.",
-      });
-      return;
-    }
-
     const teamId = body.team_id ?? (event as { team?: string }).team;
     if (!teamId || !userId) {
       log(`mention missing team/user (team=${teamId} user=${userId}), can't start stream`);
       return;
+    }
+
+    // Follow-up: this thread already has (or had) a job — route the message
+    // into its Claude session instead of spawning a second job.
+    const job = jobs.get(threadTs);
+    if (job) {
+      try {
+        const pane = findPane(await listPanes(config.tmuxBin), job);
+        if (pane) {
+          if (!registry.has(threadTs)) {
+            await ops.start({
+              channel: event.channel,
+              threadTs,
+              teamId,
+              userId,
+              prompt,
+              bootTitle: "Reconnecting to session…",
+            });
+          }
+          await injectText(config.tmuxBin, pane.id, `[slack follow-up threadTs:${threadTs}] ${prompt}`);
+          await ops.thinkingStep(threadTs, {
+            id: `followup-${event.ts}`,
+            title: "📨 Follow-up sent to the session",
+            status: "complete",
+          });
+          log(`follow-up: routed to pane ${pane.id} (${job.cwd}) for thread ${threadTs}`);
+          return;
+        }
+        log(`follow-up: no pane found for ${threadTs} (cwd=${job.cwd}), falling back`);
+      } catch (err) {
+        log(`follow-up routing failed for ${threadTs}: ${err}`);
+      }
+    }
+
+    if (registry.has(threadTs)) {
+      // live stream but session unreachable — don't stack a second job on the thread
+      log(`collision: live stream for ${threadTs} but no reachable session`);
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: "⚠️ A job is already streaming to this thread but its session is unreachable — wait for it to finish (or for the stale sweep) before mentioning me again.",
+      });
+      return;
+    }
+
+    if (job) {
+      await client.chat.postMessage({
+        channel: event.channel,
+        thread_ts: threadTs,
+        text: "ℹ️ The previous session for this thread is gone — starting a fresh job.",
+      });
     }
 
     try {

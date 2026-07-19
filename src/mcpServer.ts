@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import type { Registry } from "./registry";
 import type { StreamOps } from "./streams";
+import type { JobsIndex } from "./jobs";
 import { log } from "./log";
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -12,8 +13,31 @@ const fail = (err: unknown) => ({
   content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
 });
 
-function buildServer(ops: StreamOps): McpServer {
+function buildServer(ops: StreamOps, jobs: JobsIndex): McpServer {
   const server = new McpServer({ name: "slack-stream", version: "0.1.0" });
+
+  server.registerTool(
+    "register_job",
+    {
+      description:
+        "Register where this job's Claude session lives so follow-up Slack mentions can be routed into it. Call once at boot, before anything else.",
+      inputSchema: {
+        threadTs: z.string().describe("The thread token you were handed at launch (SLACK_THREAD_TS)"),
+        cwd: z.string().describe("Absolute path of your working directory (the worktree)"),
+        tmuxPane: z.string().optional().describe("$TMUX_PANE if set (e.g. %42)"),
+        pid: z.number().optional().describe("Your process pid"),
+        branch: z.string().optional().describe("Git branch, if known"),
+      },
+    },
+    async ({ threadTs, cwd, tmuxPane, pid, branch }) => {
+      try {
+        jobs.set({ threadTs, cwd, tmuxPane, pid, branch, registeredAt: Date.now() });
+        return ok(`registered: follow-ups to this thread will be routed to ${tmuxPane ?? cwd}`);
+      } catch (err) {
+        return fail(err);
+      }
+    },
+  );
 
   server.registerTool(
     "thinking_step",
@@ -102,14 +126,14 @@ function buildServer(ops: StreamOps): McpServer {
 const slug = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "step";
 
-export function startMcpHttp(port: number, ops: StreamOps, registry: Registry) {
+export function startMcpHttp(port: number, ops: StreamOps, registry: Registry, jobs: JobsIndex) {
   const app = express();
   app.use(express.json());
 
   // Stateless transport: fresh server+transport per request, no session bookkeeping.
   // All state lives in the shared registry, keyed by threadTs.
   app.post("/mcp", async (req, res) => {
-    const server = buildServer(ops);
+    const server = buildServer(ops, jobs);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close();

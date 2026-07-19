@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { WebClient } from "@slack/web-api";
 import { loadConfig } from "./src/config";
 import { Registry } from "./src/registry";
+import { JobsIndex } from "./src/jobs";
 import { StreamOps } from "./src/streams";
 import { createSlackApp } from "./src/slackApp";
 import { startMcpHttp } from "./src/mcpServer";
@@ -17,6 +18,7 @@ import { log } from "./src/log";
 
 const config = loadConfig();
 const registry = new Registry(join(homedir(), ".cache", "slack-to-laptop", "registry.json"));
+const jobs = new JobsIndex(join(homedir(), ".cache", "slack-to-laptop", "jobs.json"));
 const ops = new StreamOps(new WebClient(config.botToken), registry, config);
 
 // Jobs survive bridge restarts: restore the map, close any live segment
@@ -40,8 +42,8 @@ setInterval(() => {
 
 if (isSwiftBar()) startSwiftBar(registry, config.port);
 
-const httpServer = startMcpHttp(config.port, ops, registry);
-const slackApp = createSlackApp(config, registry, ops);
+const httpServer = startMcpHttp(config.port, ops, registry, jobs);
+const slackApp = createSlackApp(config, registry, ops, jobs);
 await slackApp.start();
 log("Slack socket-mode connection up");
 

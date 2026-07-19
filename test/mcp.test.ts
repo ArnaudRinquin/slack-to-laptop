@@ -3,6 +3,8 @@ import type { WebClient } from "@slack/web-api";
 import { Registry } from "../src/registry";
 import { StreamOps } from "../src/streams";
 import { startMcpHttp } from "../src/mcpServer";
+import { JobsIndex } from "../src/jobs";
+import { findPane } from "../src/inject";
 import type { Config } from "../src/config";
 
 const calls: { method: string; args: unknown }[] = [];
@@ -49,11 +51,12 @@ const fakeClient = {
 const config = { taskDisplayMode: "timeline", staleStreamMinutes: 60 } as Config;
 const PORT = 18365;
 const registry = new Registry();
+const jobs = new JobsIndex();
 const ops = new StreamOps(fakeClient, registry, config);
 let server: ReturnType<typeof startMcpHttp>;
 
 beforeAll(() => {
-  server = startMcpHttp(PORT, ops, registry);
+  server = startMcpHttp(PORT, ops, registry, jobs);
 });
 afterAll(() => server.close());
 
@@ -75,7 +78,31 @@ const callTool = (name: string, args: object) =>
 const startEntry = (threadTs: string, channel = "C1") =>
   ops.start({ channel, threadTs, teamId: "T1", userId: "U1", prompt: "do the thing" });
 
-test("initialize + tools/list exposes the 4 tools", async () => {
+test("register_job stores the session location for follow-up routing", async () => {
+  const res = await callTool("register_job", {
+    threadTs: "job.1",
+    cwd: "/tmp/worktrees/monorepo.slack-1",
+    tmuxPane: "%7",
+    pid: 4242,
+  });
+  expect(res.result.isError).toBeUndefined();
+  expect(jobs.get("job.1")).toMatchObject({ cwd: "/tmp/worktrees/monorepo.slack-1", tmuxPane: "%7" });
+});
+
+test("findPane: verifies by cwd, prefers registered pane, survives pane-id recycling", async () => {
+  const job = { threadTs: "t", cwd: "/wt/a", tmuxPane: "%3", registeredAt: Date.now() };
+  const claude = { id: "%9", path: "/wt/a", command: "2.1.211" };
+  const shell = { id: "%4", path: "/wt/a", command: "zsh" };
+
+  // registered pane id wins when it's still in the right cwd
+  expect(findPane([shell, { id: "%3", path: "/wt/a", command: "zsh" }, claude], job)?.id).toBe("%3");
+  // recycled pane id (now in another cwd) is ignored → claude-looking pane wins
+  expect(findPane([{ id: "%3", path: "/wt/OTHER", command: "zsh" }, shell, claude], job)?.id).toBe("%9");
+  // no pane in the worktree → undefined (fallback: fresh spawn)
+  expect(findPane([{ id: "%3", path: "/wt/OTHER", command: "zsh" }], job)).toBeUndefined();
+});
+
+test("initialize + tools/list exposes the 5 tools", async () => {
   const init = await rpc({
     jsonrpc: "2.0",
     id: 0,
@@ -86,7 +113,7 @@ test("initialize + tools/list exposes the 4 tools", async () => {
 
   const list = await rpc({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
   const names = list.result.tools.map((t: { name: string }) => t.name).sort();
-  expect(names).toEqual(["append_text", "finish", "set_status", "thinking_step"]);
+  expect(names).toEqual(["append_text", "finish", "register_job", "set_status", "thinking_step"]);
 });
 
 test("unknown threadTs returns clear error, not a throw", async () => {

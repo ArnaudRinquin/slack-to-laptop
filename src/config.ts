@@ -17,6 +17,8 @@ export interface Config {
   jobCwd: string;
   /** Slack user IDs allowed to trigger jobs. Empty = anyone. Others get a threaded refusal. */
   allowedUserIds: string[];
+  /** tmux binary (absolute — the SwiftBar env has a minimal PATH). */
+  tmuxBin: string;
 }
 
 export const CONFIG_PATH = join(homedir(), ".config", "slack-trigger", "config.json");
@@ -42,5 +44,6 @@ export function loadConfig(): Config {
     allowedUserIds: Array.isArray(j.allowedUserIds)
       ? j.allowedUserIds.filter((x: unknown): x is string => typeof x === "string")
       : [],
+    tmuxBin: j.tmuxBin ?? "/opt/homebrew/bin/tmux",
   };
 }

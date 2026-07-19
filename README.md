@@ -66,10 +66,29 @@ claude mcp add --transport http --scope user slack-stream http://127.0.0.1:8365/
 
 All take `threadTs` (from `SLACK_THREAD_TS`):
 
+- `register_job({threadTs, cwd, tmuxPane?, pid?, branch?})` — call once at boot; where the session lives, for follow-up routing
 - `thinking_step({threadTs, title, status, id?, details?})` — task card; `status ∈ pending|in_progress|complete|error`; same `id`/title updates the card
 - `append_text({threadTs, markdown})` — stream prose
 - `set_status({threadTs, text})` — grey "is …" line; `""` clears
-- `finish({threadTs, markdown?})` — final block + close stream. Call exactly once, last.
+- `finish({threadTs, markdown?})` — final block + close stream. Call exactly once, last (again after each follow-up).
+
+## Follow-ups
+
+Mentioning the bot again in a job's thread does NOT spawn a second job: the
+bridge looks the thread up in `~/.cache/slack-to-laptop/jobs.json` (written by
+`register_job`, survives `finish` for 7 days), verifies the session's tmux pane
+still sits in the job's worktree (pane ids get recycled — cwd is ground truth),
+and types `[slack follow-up threadTs:…] <text>` into that Claude session via
+`tmux send-keys` — mid-work it's a steering message, after finish a new turn
+with full context. A stream is reopened first if needed ("Reconnecting to
+session…"). If the pane is gone, it falls back to spawning a fresh job with a
+note. Only the typing is tmux-specific (`src/inject.ts`); finding the session
+is registration-based and generic.
+
+Future idea (deliberately not built): worktree cleanup on job end conflicts
+with follow-ups — the kept-alive session is what makes them possible. Cleanest
+shape: an explicit "cleanup" follow-up telling the session itself to remove its
+worktree and exit.
 
 A job that dies without `finish` gets swept: streams idle > `staleStreamMinutes` are stopped and cleared.
 

@@ -62,8 +62,11 @@ export class StreamOps {
     teamId: string;
     userId: string;
     prompt: string;
+    /** Boot card title — follow-ups use "Reconnecting to session…". */
+    bootTitle?: string;
   }): Promise<StreamEntry> {
-    const ts = await this.startStream(args, [BOOT_CARD]); // checklist appears instantly
+    const boot = args.bootTitle ? { ...BOOT_CARD, title: args.bootTitle } : BOOT_CARD;
+    const ts = await this.startStream(args, [boot]); // checklist appears instantly
     const now = Date.now();
     const entry: StreamEntry = {
       threadTs: args.threadTs,
@@ -77,7 +80,7 @@ export class StreamOps {
       streamStartedAt: now,
       lastActivity: now,
       lastAppendAt: now,
-      liveCards: [BOOT_CARD],
+      liveCards: [boot],
       bootPending: true,
     };
     this.registry.set(entry);
@@ -198,7 +201,8 @@ export class StreamOps {
   private drainBoot(e: StreamEntry): AnyChunk[] {
     if (!e.bootPending) return [];
     e.bootPending = false;
-    return [{ ...BOOT_CARD, status: "complete" }];
+    const boot = e.liveCards.find((c) => c.id === "boot") ?? BOOT_CARD;
+    return [{ ...boot, status: "complete" }];
   }
 
   async thinkingStep(
