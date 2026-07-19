@@ -6,6 +6,12 @@ import { log } from "./log";
 export interface StreamEntry {
   threadTs: string;
   channel: string;
+  /**
+   * "stream": native Slack stream, first ~3.5 min only (Slack hard-kills
+   * streams at ~5:00). "update": stream stopped cleanly; the same message is
+   * edited in place via chat.update from then on — no new thread messages.
+   */
+  mode: "stream" | "update";
   /** ts returned by chat.startStream — the real Slack stream id. Never leaves this process. */
   streamTs: string;
   /** Needed to restart the stream if Slack auto-closes it during a quiet stretch. */
@@ -44,9 +50,9 @@ export class Registry {
 
   /**
    * Reload entries persisted by a previous process, dropping anything the
-   * sweep would kill anyway. streamStartedAt is zeroed so the first keepalive
-   * tick force-rotates every restored stream — rotation doubles as recovery,
-   * whether the old stream survived the downtime or died during it.
+   * sweep would kill anyway. Restored entries are forced to update-mode: their
+   * stream (if any) is of unknown liveness and likely past Slack's ~5:00 kill;
+   * StreamOps.adoptRestored() stops it best-effort and edits from there.
    */
   load(maxAgeMs: number): number {
     if (!this.persistPath) return 0;
@@ -59,7 +65,6 @@ export class Registry {
     const cutoff = Date.now() - maxAgeMs;
     for (const e of entries) {
       if (!e?.threadTs || e.lastActivity < cutoff) continue;
-      e.streamStartedAt = 0;
       this.map.set(e.threadTs, e);
     }
     if (this.map.size) this.onChange();

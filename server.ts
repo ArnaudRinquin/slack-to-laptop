@@ -19,13 +19,14 @@ const config = loadConfig();
 const registry = new Registry(join(homedir(), ".cache", "slack-to-laptop", "registry.json"));
 const ops = new StreamOps(new WebClient(config.botToken), registry, config);
 
-// Streams survive bridge restarts: restore the map, let the first keepalive
-// tick force-rotate (revalidate) every restored stream.
+// Streams survive bridge restarts: restore the map, convert restored entries
+// to update-mode (their native stream, if any, is of unknown liveness).
 const restored = registry.load(config.staleStreamMinutes * 60_000);
 if (restored) log(`restored ${restored} stream(s) from previous run`);
+await ops.adoptRestored();
 
-// Keepalive: Slack kills streams ~5–6 min in no matter what — this probe append
-// detects the death so StreamOps can restart invisibly (replay + delete).
+// Slack hard-kills native streams at ~5:00 — convert each to edit-in-place
+// (chat.update) mode before that. Update-mode messages never expire.
 setInterval(() => void ops.keepalive(), 60_000).unref();
 
 // Stale sweep: a job that dies without calling finish() leaves the stream dangling

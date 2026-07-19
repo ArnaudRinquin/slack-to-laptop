@@ -73,13 +73,14 @@ All take `threadTs` (from `SLACK_THREAD_TS`):
 
 A job that dies without `finish` gets swept: streams idle > `staleStreamMinutes` are stopped and cleared.
 
-Slack hard-kills a stream ~5:00 after it opens, no matter how often we append
-(undocumented; measured — a true keepalive is impossible). The bridge therefore
-*rotates* each stream proactively at age ~3.5–4.5 min: opens a fresh stream
-seeded with the full replay log (checklist + prose), deletes the old message.
-Viewers never see a dead "stopped" message and the thread always shows exactly
-one live bot message. If a death slips through anyway (e.g. laptop slept), the
-same restart happens reactively on the next append.
+Slack hard-kills a stream ~5:00 after it opens, no matter what is appended
+(undocumented; measured — a true keepalive is impossible, even with changing
+content). The bridge therefore streams natively only while the message is
+young, then *converts*: stops the stream cleanly at age ~3.5–4.5 min and edits
+the same message in place via `chat.update` from then on (works on stopped
+streamed messages — also measured). The checklist is rendered as markdown.
+One message per job, created once — no deletes, no re-creates, no thread
+activity, no notification noise.
 
 ## Job-side skill
 
