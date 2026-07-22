@@ -178,8 +178,7 @@ async function smokeDemo(ops: StreamOps, threadTs: string) {
     await ops.thinkingStep(threadTs, { id: "work", title: "Doing the work", status: "in_progress" });
     await sleep(1500);
     await ops.thinkingStep(threadTs, { id: "work", title: "Doing the work", status: "complete" });
-    await ops.appendText(threadTs, "hi — smoke demo. Streaming works; set `jobCommand` in the config to spawn real jobs.");
-    await ops.finish(threadTs);
+    await ops.finish(threadTs, "hi — smoke demo. Streaming works; set `jobCommand` in the config to spawn real jobs.");
   } catch (err) {
     log(`smoke demo failed: ${err}`);
   }

@@ -1,36 +1,36 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import type { TaskUpdateChunk } from "@slack/types";
+import type { AnyChunk } from "@slack/types";
 import { log } from "./log";
 
 export interface StreamEntry {
   threadTs: string;
   channel: string;
   /**
-   * "stream": a native Slack streamed message (segment) is live. "idle": the
-   * segment was closed cleanly before Slack's ~5:00 kill; the next job call
-   * lazily opens a fresh segment.
+   * "stream": the job's single message is a live native stream (young, full
+   * card UI). "update": the stream was stopped before Slack's ~5:00 kill and
+   * the SAME message is now edited in place via chat.update — forever.
    */
-  mode: "stream" | "idle";
-  /** ts returned by chat.startStream — the real Slack stream id. Never leaves this process. */
+  mode: "stream" | "update";
+  /** ts of the job's single message (returned by chat.startStream). Never leaves this process. */
   streamTs: string;
-  /** Needed to restart the stream if Slack auto-closes it during a quiet stretch. */
+  /** Needed to open the final-report stream (and reopen on follow-ups). */
   teamId: string;
   userId: string;
   prompt: string;
   startedAt: number;
-  /** When the CURRENT Slack stream opened (reset on rotation) — drives proactive rotation. */
+  /** When the native stream opened — drives the proactive stream→update conversion. */
   streamStartedAt: number;
   /** Last job-originated MCP call — drives the stale sweep. */
   lastActivity: number;
-  /** Last successful append to the current segment. */
+  /** Last successful write (append or edit) to the message. */
   lastAppendAt: number;
   /**
-   * Task cards currently in_progress in the LIVE segment. Slack renders frozen
-   * in_progress cards with a ⚠️ once the stream stops — so closes mark these
-   * complete first (the step visibly continues in the next segment).
+   * Replay log: every chunk ever appended, with task_update chunks collapsed
+   * by id to their latest state. In update-mode each edit re-renders this log
+   * in full; across bridge restarts it's what makes the message recoverable.
    */
-  liveCards: TaskUpdateChunk[];
+  chunks: AnyChunk[];
   /** Boot card still spinning — completed on the job's first MCP call. */
   bootPending: boolean;
 }
@@ -50,8 +50,8 @@ export class Registry {
 
   /**
    * Reload entries persisted by a previous process, dropping anything the
-   * sweep would kill anyway. StreamOps.adoptRestored() then closes any live
-   * segment cleanly; the next job call opens a fresh one.
+   * sweep would kill anyway. StreamOps.adoptRestored() then converts any
+   * still-streaming entry to update-mode (its liveness is unknown).
    */
   load(maxAgeMs: number): number {
     if (!this.persistPath) return 0;
@@ -64,7 +64,8 @@ export class Registry {
     const cutoff = Date.now() - maxAgeMs;
     for (const e of entries) {
       if (!e?.threadTs || e.lastActivity < cutoff) continue;
-      e.liveCards ??= [];
+      e.chunks ??= [];
+      if (e.mode !== "stream") e.mode = "update"; // migrates pre-update-mode snapshots ("idle")
       this.map.set(e.threadTs, e);
     }
     if (this.map.size) this.onChange();

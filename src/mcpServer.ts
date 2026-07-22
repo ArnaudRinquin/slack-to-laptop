@@ -65,7 +65,8 @@ function buildServer(ops: StreamOps, jobs: JobsIndex): McpServer {
   server.registerTool(
     "append_text",
     {
-      description: "Stream markdown prose into the Slack response message.",
+      description:
+        "Add markdown prose to the progress message. Only for genuinely important mid-course findings — the final summary belongs in finish(markdown).",
       inputSchema: {
         threadTs: z.string().describe("The thread token you were handed at launch (SLACK_THREAD_TS)"),
         markdown: z.string().describe("Markdown to append"),
@@ -104,10 +105,10 @@ function buildServer(ops: StreamOps, jobs: JobsIndex): McpServer {
     "finish",
     {
       description:
-        "Finalize the Slack stream. Call exactly once, as your last act. Optional markdown is appended as the final block.",
+        "Finalize the job: settles the progress checklist, then posts the optional markdown as its own final-report reply (the user's one notification). Call exactly once, as your last act.",
       inputSchema: {
         threadTs: z.string().describe("The thread token you were handed at launch (SLACK_THREAD_TS)"),
-        markdown: z.string().optional().describe("Optional final markdown block"),
+        markdown: z.string().optional().describe("Final report markdown — posted as a separate reply"),
       },
     },
     async ({ threadTs, markdown }) => {

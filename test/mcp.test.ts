@@ -40,6 +40,8 @@ const fakeClient = {
     },
     postMessage: async (args: unknown) => (calls.push({ method: "postMessage", args }), { ok: true }),
     delete: async (args: unknown) => (calls.push({ method: "delete", args }), { ok: true }),
+    // chat.update works on stopped/dead streamed messages (measured) — never gated on deadStreams
+    update: async (args: unknown) => (calls.push({ method: "update", args }), { ok: true }),
   },
   assistant: {
     threads: {
@@ -122,7 +124,7 @@ test("unknown threadTs returns clear error, not a throw", async () => {
   expect(res.result.content[0].text).toContain("no live stream for threadTs=nope");
 });
 
-test("full lifecycle: start (boot card) → thinking_step → append_text → finish", async () => {
+test("full lifecycle: start (boot card) → thinking_step → append_text → finish + separate report", async () => {
   const entry = await startEntry("111.222");
   expect(registry.has("111.222")).toBe(true);
   const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
@@ -142,16 +144,19 @@ test("full lifecycle: start (boot card) → thinking_step → append_text → fi
   const fin = await callTool("finish", { threadTs: "111.222", markdown: "done" });
   expect(fin.result.content[0].text).toBe("stream finished");
   expect(registry.has("111.222")).toBe(false);
-  // final markdown travels via appendStream; the stop is PLAIN (md-stop on a
-  // chunked stream → streaming_mode_mismatch, enforced by the fake)
+  // still young at finish → the progress message keeps its native cards: the
+  // lingering in_progress card is completed (no frozen ⚠️), then a PLAIN stop
   const appends = calls.filter((c) => c.method === "appendStream").map((c) => c.args as Record<string, unknown>);
-  expect(appends.some((a) => (a.chunks as { text?: string }[]).some((c) => c.text === "done"))).toBe(true);
-  // the close completed the still-in_progress card so it doesn't freeze as ⚠️
   const closing = appends[appends.length - 1]!.chunks as { id?: string; status?: string }[];
   expect(closing.some((c) => c.id === "run-tests" && c.status === "complete")).toBe(true);
-  const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
-  expect(stop).toMatchObject({ channel: "C1", ts: entry.streamTs });
-  expect(stop.markdown_text).toBeUndefined();
+  const stops = calls.filter((c) => c.method === "stopStream").map((c) => c.args as Record<string, unknown>);
+  expect(stops.find((s) => s.ts === entry.streamTs)!.markdown_text).toBeUndefined();
+  // the report is its own message: fresh stream seeded with the markdown, plain stop
+  const reportStart = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
+  expect((reportStart.chunks as { text?: string }[]).some((c) => c.text === "done")).toBe(true);
+  const reportStop = stops[stops.length - 1]!;
+  expect(reportStop.ts).not.toBe(entry.streamTs);
+  expect(reportStop.markdown_text).toBeUndefined();
   // status cleared on finish
   expect(calls.findLast((c) => c.method === "setStatus")!.args).toMatchObject({ status: "" });
 
@@ -160,90 +165,87 @@ test("full lifecycle: start (boot card) → thinking_step → append_text → fi
   expect(again.result.isError).toBe(true);
 });
 
-test("keepalive closes aging segments cleanly; next content lazily opens a fresh one", async () => {
-  const entry = await startEntry("seg.1");
-  const oldTs = entry.streamTs;
-  entry.streamStartedAt = Date.now() - 4 * 60_000; // past the segment window
+test("keepalive converts aging streams to update-mode: same message, edited from then on", async () => {
+  const entry = await startEntry("upd.1");
+  const msgTs = entry.streamTs;
+  entry.streamStartedAt = Date.now() - 4 * 60_000; // past the conversion window
 
   await ops.keepalive(210_000);
-  expect(entry.mode).toBe("idle");
-  // in_progress cards completed + sign-off appended, then a PLAIN stop
-  const closer = calls.findLast((c) => c.method === "appendStream")!.args as Record<string, unknown>;
-  const closerChunks = closer.chunks as { id?: string; status?: string; text?: string }[];
-  expect(closerChunks.some((c) => c.id === "boot" && c.status === "complete")).toBe(true); // no frozen ⚠️
-  expect(closerChunks.some((c) => c.text?.includes("still working"))).toBe(true);
+  expect(entry.mode).toBe("update");
+  // plain stop of the native stream, then a full chat.update render of the SAME message
   const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
-  expect(stop.ts).toBe(oldTs);
+  expect(stop).toMatchObject({ ts: msgTs });
   expect(stop.markdown_text).toBeUndefined();
-  expect(calls.some((c) => c.method === "delete")).toBe(false); // chapters are kept
+  const upd = calls.findLast((c) => c.method === "update")!.args as Record<string, unknown>;
+  expect(upd.ts).toBe(msgTs);
+  expect(upd.text as string).toContain("Booting worktree job");
+  // NATIVE cards survive conversion: task_update chunks render as task_card blocks
+  const updBlocks = upd.blocks as { type: string; task_id?: string; status?: string }[];
+  expect(updBlocks.some((b) => b.type === "task_card" && b.task_id === "boot")).toBe(true);
+  expect(updBlocks[updBlocks.length - 1]!.type).toBe("context"); // live footer while unfinished
+  expect(JSON.stringify(updBlocks)).toContain("still working");
 
-  // idle + no content → nothing happens (quiet stretches create no messages)
+  // converted entries need nothing further from the keepalive
   const before = calls.length;
   await ops.keepalive(210_000);
   expect(calls.length).toBe(before);
 
-  // next content opens a fresh segment seeded with exactly that content
-  await ops.thinkingStep("seg.1", { id: "s1", title: "Next step", status: "in_progress" });
-  expect(entry.mode).toBe("stream");
-  expect(entry.streamTs).not.toBe(oldTs);
-  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
-  const seeded = start.chunks as { id?: string }[];
-  expect(seeded.some((c) => c.id === "s1")).toBe(true);
-  await ops.finish("seg.1");
+  // subsequent steps EDIT the same message — never a new one
+  const starts = calls.filter((c) => c.method === "startStream").length;
+  await ops.thinkingStep("upd.1", { id: "s1", title: "Next step", status: "in_progress" });
+  expect(calls.filter((c) => c.method === "startStream").length).toBe(starts);
+  const upd2 = calls.findLast((c) => c.method === "update")!.args as Record<string, unknown>;
+  expect(upd2.ts).toBe(msgTs);
+  expect(upd2.text as string).toContain("⏳ Next step");
+
+  // finish: final render has no live footer, settles the spinner to ✅
+  await ops.finish("upd.1");
+  const final = calls.findLast((c) => c.method === "update")!.args as Record<string, unknown>;
+  expect(final.ts).toBe(msgTs);
+  expect(final.text as string).toContain("✅ Next step");
+  const finalBlocks = final.blocks as { type: string; task_id?: string; status?: string }[];
+  expect(finalBlocks.find((b) => b.task_id === "s1")!.status).toBe("complete");
+  expect(finalBlocks.every((b) => b.type !== "context")).toBe(true); // no footer
+  // block-form quirk: pending is rejected — renderBlocks must never emit it
+  expect(finalBlocks.every((b) => b.status !== "pending")).toBe(true);
 });
 
-test("self-heal: segment died before the clean close — next append opens a fresh segment", async () => {
+test("self-heal: stream died before conversion — chunks fold into the edited message", async () => {
   const entry = await startEntry("heal.1");
   await ops.appendText("heal.1", "progress so far");
-  const oldTs = entry.streamTs;
-  deadStreams.add(oldTs);
+  deadStreams.add(entry.streamTs);
 
   await ops.thinkingStep("heal.1", { id: "s1", title: "Step", status: "in_progress" });
-  expect(entry.mode).toBe("stream");
-  expect(entry.streamTs).not.toBe(oldTs);
-  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
-  expect((start.chunks as { id?: string }[]).some((c) => c.id === "s1")).toBe(true);
+  expect(entry.mode).toBe("update");
+  const upd = calls.findLast((c) => c.method === "update")!.args as Record<string, unknown>;
+  expect(upd.ts).toBe(entry.streamTs); // same message, taken over by chat.update
+  expect(upd.text as string).toContain("progress so far");
+  expect(upd.text as string).toContain("⏳ Step");
   await ops.finish("heal.1");
   deadStreams.clear();
 });
 
-test("finish on idle entry delivers the final as its own native, immediately-closed segment", async () => {
-  const entry = await startEntry("idle.1");
-  entry.bootPending = false;
-  entry.streamStartedAt = Date.now() - 4 * 60_000;
-  await ops.keepalive(210_000);
-  expect(entry.mode).toBe("idle");
-
-  await ops.finish("idle.1", "final words");
-  expect(registry.has("idle.1")).toBe(false);
-  // the final opened its own segment seeded with the markdown, then plain-stopped
-  const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
-  expect((start.chunks as { text?: string }[]).some((c) => c.text === "final words")).toBe(true);
-  const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
-  expect(stop.ts).toBe(entry.streamTs); // the fresh final segment
-  expect(stop.markdown_text).toBeUndefined();
-});
-
-test("finish on dead segment delivers the final via a fresh segment", async () => {
+test("finish on dead stream still settles via chat.update and posts the report", async () => {
   const entry = await startEntry("dead.1");
   entry.bootPending = false;
-  const oldTs = entry.streamTs;
-  deadStreams.add(oldTs);
+  deadStreams.add(entry.streamTs);
 
   await ops.finish("dead.1", "final words");
   expect(registry.has("dead.1")).toBe(false);
+  const upd = calls.findLast((c) => c.method === "update")!.args as Record<string, unknown>;
+  expect(upd.ts).toBe(entry.streamTs);
   const start = calls.findLast((c) => c.method === "startStream")!.args as Record<string, unknown>;
   expect((start.chunks as { text?: string }[]).some((c) => c.text === "final words")).toBe(true);
   const stop = calls.findLast((c) => c.method === "stopStream")!.args as Record<string, unknown>;
-  expect(stop.ts).not.toBe(oldTs);
+  expect(stop.ts).not.toBe(entry.streamTs); // report went out on its own fresh stream
   expect(stop.markdown_text).toBeUndefined();
   deadStreams.clear();
 });
 
-test("finish falls back to plain reply when even the fresh segment fails", async () => {
+test("report falls back to plain reply when its stream can't start", async () => {
   const entry = await startEntry("dead.2");
   entry.bootPending = false;
-  deadStreams.add(entry.streamTs);
+  entry.mode = "update";
   failStarts = true;
 
   await ops.finish("dead.2", "final words");
@@ -251,7 +253,6 @@ test("finish falls back to plain reply when even the fresh segment fails", async
   const post = calls.findLast((c) => c.method === "postMessage")!.args as Record<string, unknown>;
   expect(post).toMatchObject({ thread_ts: "dead.2", text: "final words" });
   failStarts = false;
-  deadStreams.clear();
 });
 
 test("registry persists and restores across processes; stale entries dropped", async () => {
@@ -268,7 +269,7 @@ test("registry persists and restores across processes; stale entries dropped", a
   expect(r2.load(60 * 60_000)).toBe(1); // stale one dropped
   const restored = r2.get("per.1")!;
   expect(restored.streamTs).toBe(live.streamTs);
-  expect(restored.mode).toBe("stream"); // adoptRestored() closes these on boot
+  expect(restored.mode).toBe("stream"); // adoptRestored() converts these on boot
   const { unlinkSync } = await import("node:fs");
   unlinkSync(path);
 });

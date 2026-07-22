@@ -21,14 +21,14 @@ const registry = new Registry(join(homedir(), ".cache", "slack-to-laptop", "regi
 const jobs = new JobsIndex(join(homedir(), ".cache", "slack-to-laptop", "jobs.json"));
 const ops = new StreamOps(new WebClient(config.botToken), registry, config);
 
-// Jobs survive bridge restarts: restore the map, close any live segment
-// cleanly — the job's next call opens a fresh one.
+// Jobs survive bridge restarts: restore the map; still-streaming entries are
+// converted to update-mode (the replay log re-renders the whole message).
 const restored = registry.load(config.staleStreamMinutes * 60_000);
 if (restored) log(`restored ${restored} stream(s) from previous run`);
 await ops.adoptRestored();
 
-// Slack hard-kills native streams at ~5:00 — close each segment cleanly before
-// that ("…still working"); the job's next call opens a fresh segment.
+// Slack hard-kills native streams at ~5:00 — convert each job's single message
+// to chat.update edit-in-place before that. One message per job, zero churn.
 setInterval(() => void ops.keepalive(), 60_000).unref();
 
 // Stale sweep: a job that dies without calling finish() leaves the stream dangling

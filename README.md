@@ -67,10 +67,10 @@ claude mcp add --transport http --scope user slack-stream http://127.0.0.1:8365/
 All take `threadTs` (from `SLACK_THREAD_TS`):
 
 - `register_job({threadTs, cwd, tmuxPane?, pid?, branch?})` — call once at boot; where the session lives, for follow-up routing
-- `thinking_step({threadTs, title, status, id?, details?})` — task card; `status ∈ pending|in_progress|complete|error`; same `id`/title updates the card
-- `append_text({threadTs, markdown})` — stream prose
+- `thinking_step({threadTs, title, status, id?, details?})` — checklist step; `status ∈ pending|in_progress|complete|error`; same `id`/title updates the step
+- `append_text({threadTs, markdown})` — prose in the progress message (important mid-course findings only)
 - `set_status({threadTs, text})` — grey "is …" line; `""` clears
-- `finish({threadTs, markdown?})` — final block + close stream. Call exactly once, last (again after each follow-up).
+- `finish({threadTs, markdown?})` — settle the progress message + post `markdown` as its own final-report reply (the user's one notification). Call exactly once, last (again after each follow-up).
 
 ## Follow-ups
 
@@ -94,16 +94,27 @@ A job that dies without `finish` gets swept: streams idle > `staleStreamMinutes`
 
 Slack hard-kills a stream ~5:00 after it opens, no matter what is appended
 (undocumented; measured — a true keepalive is impossible, even with changing
-content). Jobs therefore stream in *segments*: each streamed message is closed
-cleanly at age ~3.5–4.5 min with a "_⏳ still working…_" sign-off (no kill
-warning), and the next segment is opened lazily — only when the job next has
-content. Every message is a finished chapter; quiet stretches create nothing;
-nothing is ever deleted or edited away. The final summary gets its own
-immediately-closed native segment when needed.
+content), and there is no way to re-stream onto an existing `ts`. Each job
+therefore gets ONE progress message: it streams natively while young (full
+card UI), is stopped cleanly at age ~3.5–4.5 min, and is edited in place via
+`chat.update` from then on (works on stopped streamed messages — measured).
+Conversion keeps the NATIVE cards: `task_card` is a real Block Kit block
+(changelog 2026-02-11), accepted by `chat.update` even on a stopped stream
+(measured) — the message re-renders from the replay log with identical card
+UI. No splits, no dup cards, no pings, no visual downgrade. The final report
+is the only other message — posted on `finish(markdown)`, one notification,
+exactly when you want it.
 
-API gotcha (measured): `chat.stopStream` with `markdown_text` only works on a
-stream with NO chunks appended — `streaming_mode_mismatch` otherwise. Closers
-and finals must go through `chat.appendStream`, then a plain stop.
+Block-form quirks vs the chunk form (measured): `task_card` blocks REQUIRE
+`status` and reject `"pending"` (enum `in_progress|complete|error`) — pending
+steps simply aren't rendered yet; the `plan` block's `title` must be a plain
+string, not a `plain_text` object.
+
+API gotchas (measured): `chat.stopStream` with `markdown_text` only works on a
+stream with NO chunks appended — `streaming_mode_mismatch` otherwise (the
+report is delivered as a chunkless stream + markdown-stop for the native
+agent look). Frozen `in_progress` cards render with a ⚠️ — finish completes
+them before its plain stop.
 
 ## Job-side skill
 
@@ -118,6 +129,57 @@ streaming; if a call errors with "no live stream", the stream was swept —
 continue the work, stop streaming.
 
 `GET /healthz` lists active streams.
+
+## Build your own
+
+Want the same thing but different? The architecture is small enough to rebuild
+in an afternoon — here's the TL;DR to hand your agent (or read yourself).
+
+**The shape.** One long-lived local process with three roles:
+
+1. **Listener** — Slack Socket Mode (`@slack/bolt`), subscribed to
+   `app_mention`. On mention: open the progress message instantly (so the user
+   sees life before any job boots), then spawn the job however you like.
+2. **Bridge** — a local HTTP MCP server (`@modelcontextprotocol/sdk`,
+   stateless transport). The job's agent calls 5 tools: `register_job`,
+   `thinking_step`, `append_text`, `set_status`, `finish`.
+3. **Status** — optional (here: SwiftBar menubar). Any observer works;
+   `GET /healthz` is the hook.
+
+**The one design trick**: the job never holds Slack credentials or message
+ids. It only knows `threadTs` — a correlation token passed inside its prompt —
+and the bridge maps it to the real channel/message and owns the token. Any
+runner (tmux, container, CI, SSH) works as long as the token rides along and
+the runner can reach `127.0.0.1:8365`.
+
+**The Slack rendering strategy** (the hard-won part — all measured, none
+documented; see the section above for detail):
+
+- Native streams (`chat.startStream`) look great but die ~5:00 in, no
+  keepalive possible, no re-stream onto the same ts.
+- `chat.update` works on stopped streamed messages, edits never ping.
+- `task_card` is a real Block Kit block — `chat.update` can render the SAME
+  native card UI forever. Quirks: `status` required, `"pending"` rejected,
+  `plan.title` must be a plain string.
+- ⇒ one message per job: stream while young, convert to edit-in-place at
+  ~3.5 min, keep native cards throughout. Final report = separate message =
+  the single notification.
+
+**State**: one JSON map `threadTs → {messageTs, mode, replayLog}` snapshotted
+to disk — that's what makes bridge restarts invisible to running jobs (replay
+log re-renders the whole message). A second file maps `threadTs → session
+location` so re-mentions in a thread route INTO the running session (here:
+`tmux send-keys`, cwd-verified) instead of spawning a duplicate.
+
+**Reliability floor**: dedupe redelivered Slack events (3s ack window); a
+stale sweep for jobs that die without `finish`; every Slack write has a
+fallback chain ending in plain `chat.postMessage`.
+
+**Adaptation points** — each is one file here: how jobs launch
+(`scripts/launch-job.zsh` — swap for docker/ssh/whatever), how follow-ups
+reach a session (`src/inject.ts` — the only tmux-specific code), what the
+agent streams (your job-side skill/prompt: milestones as `thinking_step`,
+summary in `finish(markdown)`, ALWAYS finish — also on failure).
 
 ## SwiftBar
 
